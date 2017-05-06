@@ -425,6 +425,34 @@ if (window.ko) {
         trigger: "hover"
     }
   };
+
+  ko.bindingHandlers.typeahead = {
+      init: function (element, valueAccessor, allBindingsAccessor, viewModel, bindingContext) {
+          var $element = $(element);
+          var allBindings = allBindingsAccessor();
+
+          $element.typeahead({
+              highlight: true,
+              minLength: 0,
+          },
+          {
+              name: 'data',
+              display: allBindings.key,
+              limit: 50,
+              source: searchData(allBindings.items, allBindings.key)
+          }).on('typeahead:change', function(element, datum, name) {
+              var value = valueAccessor();
+              value(datum);
+          });
+      },
+
+      update: function (element, valueAccessor) {
+          var value = ko.utils.unwrapObservable(valueAccessor());
+          if (value) {
+              $(element).typeahead('val', value);
+          }
+      }
+  };
 }
 
 function getContactDisplayName(contact)
@@ -473,7 +501,11 @@ function populateInvoiceComboboxes(clientId, invoiceId) {
   $clientSelect.append(new Option('', ''));
   for (var i=0; i<clients.length; i++) {
     var client = clients[i];
-    $clientSelect.append(new Option(getClientDisplayName(client), client.public_id));
+    var clientName = getClientDisplayName(client);
+    if (!clientName) {
+        continue;
+    }
+    $clientSelect.append(new Option(clientName, client.public_id));
   }
 
   if (clientId) {
@@ -497,7 +529,7 @@ function populateInvoiceComboboxes(clientId, invoiceId) {
     for (var i=0; i<list.length; i++) {
       var invoice = list[i];
       var client = clientMap[invoice.client.public_id];
-      if (!client) continue; // client is deleted/archived
+      if (!client || !getClientDisplayName(client)) continue; // client is deleted/archived
       $invoiceCombobox.append(new Option(invoice.invoice_number + ' - ' + invoice.invoice_status.name + ' - ' +
                 getClientDisplayName(client) + ' - ' + formatMoneyInvoice(invoice.amount, invoice) + ' | ' +
                 formatMoneyInvoice(invoice.balance, invoice),  invoice.public_id));
@@ -556,7 +588,7 @@ function formatAddress(city, state, zip, swap) {
         str += zip ? zip + ' ' : '';
         str += city ? city : '';
         str += (city && state) ? ', ' : (city ? ' ' : '');
-        str += state;        
+        str += state;
     } else {
         str += city ? city : '';
         str += (city && state) ? ', ' : (state ? ' ' : '');
@@ -589,11 +621,18 @@ function calculateAmounts(invoice) {
   var total = 0;
   var hasTaxes = false;
   var taxes = {};
+  invoice.has_product_key = false;
+
+  // Bold designs currently breaks w/o the product column
+  if (invoice.invoice_design_id == 2) {
+      invoice.has_product_key = true;
+  }
 
   // sum line item
   for (var i=0; i<invoice.invoice_items.length; i++) {
     var item = invoice.invoice_items[i];
     var lineTotal = roundToTwo(NINJA.parseFloat(item.cost)) * roundToTwo(NINJA.parseFloat(item.qty));
+    lineTotal = roundToTwo(lineTotal);
     if (lineTotal) {
       total += lineTotal;
     }
@@ -601,16 +640,25 @@ function calculateAmounts(invoice) {
 
   for (var i=0; i<invoice.invoice_items.length; i++) {
     var item = invoice.invoice_items[i];
-    var taxRate = 0;
-    var taxName = '';
+    var taxRate1 = 0;
+    var taxName1 = '';
+    var taxRate2 = 0;
+    var taxName2 = '';
 
-    // the object structure differs if it's read from the db or created by knockoutJS
-    if (item.tax && parseFloat(item.tax.rate)) {
-      taxRate = parseFloat(item.tax.rate);
-      taxName = item.tax.name;
-    } else if (item.tax_rate && parseFloat(item.tax_rate)) {
-      taxRate = parseFloat(item.tax_rate);
-      taxName = item.tax_name;
+    if (item.product_key) {
+        invoice.has_product_key = true;
+    } else if (invoice.invoice_items.length == 1 && !item.qty) {
+        invoice.has_product_key = true;
+    }
+
+    if (item.tax_name1) {
+      taxRate1 = parseFloat(item.tax_rate1);
+      taxName1 = item.tax_name1;
+    }
+
+    if (item.tax_name2) {
+      taxRate2 = parseFloat(item.tax_rate2);
+      taxName2 = item.tax_name2;
     }
 
     // calculate line item tax
@@ -622,18 +670,28 @@ function calculateAmounts(invoice) {
             lineTotal -= roundToTwo(lineTotal * (invoice.discount/100));
         }
     }
-    var taxAmount = roundToTwo(lineTotal * taxRate / 100);
 
-    if (taxRate) {
-      var key = taxName + taxRate;
+    var taxAmount1 = roundToTwo(lineTotal * taxRate1 / 100);
+    if (taxName1) {
+      var key = taxName1 + taxRate1;
       if (taxes.hasOwnProperty(key)) {
-        taxes[key].amount += taxAmount;
+        taxes[key].amount += taxAmount1;
       } else {
-        taxes[key] = {name: taxName, rate:taxRate, amount:taxAmount};
+        taxes[key] = {name: taxName1, rate:taxRate1, amount:taxAmount1};
       }
     }
 
-    if ((item.tax && item.tax.name) || item.tax_name) {
+    var taxAmount2 = roundToTwo(lineTotal * taxRate2 / 100);
+    if (taxName2) {
+      var key = taxName2 + taxRate2;
+      if (taxes.hasOwnProperty(key)) {
+        taxes[key].amount += taxAmount2;
+      } else {
+        taxes[key] = {name: taxName2, rate:taxRate2, amount:taxAmount2};
+      }
+    }
+
+    if (item.tax_name1 || item.tax_name2) {
       hasTaxes = true;
     }
   }
@@ -658,17 +716,17 @@ function calculateAmounts(invoice) {
     total += roundToTwo(invoice.custom_value2);
   }
 
-  var tax = 0;
-  if (invoice.tax && parseFloat(invoice.tax.rate)) {
-    tax = parseFloat(invoice.tax.rate);
-  } else if (invoice.tax_rate && parseFloat(invoice.tax_rate)) {
-    tax = parseFloat(invoice.tax_rate);
+  taxRate1 = 0;
+  taxRate2 = 0;
+  if (invoice.tax_rate1 && parseFloat(invoice.tax_rate1)) {
+    taxRate1 = parseFloat(invoice.tax_rate1);
   }
-
-  if (tax) {
-    var tax = roundToTwo(total * (tax/100));
-    total = parseFloat(total) + parseFloat(tax);
+  if (invoice.tax_rate2 && parseFloat(invoice.tax_rate2)) {
+    taxRate2 = parseFloat(invoice.tax_rate2);
   }
+  taxAmount1 = roundToTwo(total * (taxRate1/100));
+  taxAmount2 = roundToTwo(total * (taxRate2/100));
+  total = total + taxAmount1 + taxAmount2;
 
   for (var key in taxes) {
     if (taxes.hasOwnProperty(key)) {
@@ -684,11 +742,12 @@ function calculateAmounts(invoice) {
     total += roundToTwo(invoice.custom_value2);
   }
 
-  invoice.total_amount = roundToTwo(total) - (roundToTwo(invoice.amount) - roundToTwo(invoice.balance));
+  invoice.total_amount = roundToTwo(roundToTwo(total) - (roundToTwo(invoice.amount) - roundToTwo(invoice.balance)));
   invoice.discount_amount = discount;
-  invoice.tax_amount = tax;
+  invoice.tax_amount1 = taxAmount1;
+  invoice.tax_amount2 = taxAmount2;
   invoice.item_taxes = taxes;
-  
+
   if (NINJA.parseFloat(invoice.partial)) {
     invoice.balance_amount = roundToTwo(invoice.partial);
   } else {
@@ -696,16 +755,6 @@ function calculateAmounts(invoice) {
   }
 
   return invoice;
-}
-
-function getInvoiceTaxRate(invoice) {
-  var tax = 0;
-  if (invoice.tax && parseFloat(invoice.tax.rate)) {
-    tax = parseFloat(invoice.tax.rate);
-  } else if (invoice.tax_rate && parseFloat(invoice.tax_rate)) {
-    tax = parseFloat(invoice.tax_rate);
-  }
-  return tax;
 }
 
 // http://stackoverflow.com/questions/11941876/correctly-suppressing-warnings-in-datatables
@@ -961,6 +1010,11 @@ function truncate(str, length) {
   return (str && str.length > length) ? (str.substr(0, length-1) + '...') : str;
 }
 
+// http://stackoverflow.com/questions/280634/endswith-in-javascript
+function endsWith(str, suffix) {
+    return str.indexOf(suffix, str.length - suffix.length) !== -1;
+}
+
 // http://codeaid.net/javascript/convert-seconds-to-hours-minutes-and-seconds-%28javascript%29
 function secondsToTime(secs)
 {
@@ -993,6 +1047,11 @@ function toSnakeCase(str) {
     return str.replace(/([A-Z])/g, function($1){return "_"+$1.toLowerCase();});
 }
 
+// https://coderwall.com/p/iprsng/convert-snake-case-to-camelcase
+function snakeToCamel(s){
+    return s.replace(/_([a-z])/g, function (g) { return g[1].toUpperCase(); });
+}
+
 function getDescendantProp(obj, desc) {
     var arr = desc.split(".");
     while(arr.length && (obj = obj[arr.shift()]));
@@ -1001,6 +1060,7 @@ function getDescendantProp(obj, desc) {
 
 function doubleDollarSign(str) {
     if (!str) return '';
+    if (!str.replace) return str;
     return str.replace(/\$/g, '\$\$\$');
 }
 
@@ -1012,9 +1072,9 @@ function truncate(string, length){
    }
 };
 
-// Show/hide the 'Select' option in the datalists 
+// Show/hide the 'Select' option in the datalists
 function actionListHandler() {
-    $('tbody tr').mouseover(function() {
+    $('tbody tr .tr-action').closest('tr').mouseover(function() {
         $(this).closest('tr').find('.tr-action').show();
         $(this).closest('tr').find('.tr-status').hide();
     }).mouseout(function() {
@@ -1024,4 +1084,62 @@ function actionListHandler() {
           $(this).closest('tr').find('.tr-status').show();
         }
     });
+}
+
+function loadImages(selector) {
+    $(selector + ' img').each(function(index, item) {
+        var src = $(item).attr('data-src');
+        $(item).attr('src', src);
+        $(item).attr('data-src', src);
+    });
+}
+
+// http://stackoverflow.com/questions/4810841/how-can-i-pretty-print-json-using-javascript
+function prettyJson(json) {
+    if (typeof json != 'string') {
+         json = JSON.stringify(json, undefined, 2);
+    }
+    json = json.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function (match) {
+        var cls = 'number';
+        if (/^"/.test(match)) {
+            if (/:$/.test(match)) {
+                cls = 'key';
+            } else {
+                cls = 'string';
+            }
+        } else if (/true|false/.test(match)) {
+            cls = 'boolean';
+        } else if (/null/.test(match)) {
+            cls = 'null';
+        }
+        match = snakeToCamel(match);
+        return '<span class="' + cls + '">' + match + '</span>';
+    });
+}
+
+function searchData(data, key, fuzzy) {
+    return function findMatches(q, cb) {
+    var matches, substringRegex;
+    if (fuzzy) {
+        var options = {
+          keys: [key],
+        }
+        var fuse = new Fuse(data, options);
+        matches = fuse.search(q);
+    } else {
+        matches = [];
+        substrRegex = new RegExp(escapeRegExp(q), 'i');
+        $.each(data, function(i, obj) {
+          if (substrRegex.test(obj[key])) {
+            matches.push(obj);
+          }
+        });
+    }
+    cb(matches);
+    }
+};
+
+function escapeRegExp(str) {
+  return str.replace(/[\-\[\]\/\{\}\(\)\*\+\?\.\\\^\$\|]/g, "\\$&");
 }
